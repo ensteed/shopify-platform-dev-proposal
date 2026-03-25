@@ -1,0 +1,632 @@
+#+TITLE: Custom Platform Development Proposal
+#+SUBTITLE: Shopify-Integrated Customer Portal & Feature Modules
+#+AUTHOR: Daniel Randle
+#+OPTIONS: toc:nil num:nil
+#+STARTUP: overview
+
+#+LATEX_CLASS: article
+#+LATEX_CLASS_OPTIONS: [11pt]
+
+#+LATEX_HEADER: \usepackage[margin=1in]{geometry}
+#+LATEX_HEADER: \usepackage{parskip}
+#+LATEX_HEADER: \usepackage{titlesec}
+#+LATEX_HEADER: \usepackage{enumitem}
+#+LATEX_HEADER: \usepackage{xcolor}
+#+LATEX_HEADER: \usepackage{helvet}
+#+LATEX_HEADER: \usepackage{booktabs}
+#+LATEX_HEADER: \usepackage{longtable}
+#+LATEX_HEADER: \usepackage{array}
+#+LATEX_HEADER: \usepackage{colortbl}
+#+LATEX_HEADER: \renewcommand{\familydefault}{\sfdefault}
+
+#+LATEX_HEADER: \definecolor{accent}{RGB}{31, 78, 121}
+#+LATEX_HEADER: \definecolor{lightgray}{RGB}{245, 245, 245}
+#+LATEX_HEADER: \definecolor{rowgray}{RGB}{240, 240, 240}
+
+#+LATEX_HEADER: \titleformat{\section}{\large\bfseries\color{accent}}{}{0em}{}[\vspace{2pt}\titlerule\vspace{4pt}]
+#+LATEX_HEADER: \titleformat{\subsection}{\normalsize\bfseries}{}{0em}{}
+#+LATEX_HEADER: \titleformat{\subsubsection}{\normalsize\itshape}{}{0em}{}
+
+#+LATEX_HEADER: \titlespacing*{\section}{0pt}{16pt}{8pt}
+#+LATEX_HEADER: \titlespacing*{\subsection}{0pt}{12pt}{4pt}
+
+#+LATEX_HEADER: \setlist[itemize]{noitemsep, topsep=4pt, leftmargin=1.2em}
+#+LATEX_HEADER: \setlist[enumerate]{noitemsep, topsep=4pt, leftmargin=1.2em}
+#+LATEX_HEADER: \linespread{1.15}
+
+* Introduction
+
+Thanks for the platform brief. I have read it in full, including the open questions sections at the end of each module.
+
+My overall read: this is not a Shopify customization project. It is a purpose-built application platform that uses Shopify as a commerce engine and integration point. The scope, the identity architecture, the Klaviyo event pipeline, the four feature modules, and the TapCart delivery requirements all point to a system that needs to be designed and built as a platform from the ground up.
+
+This proposal outlines how I would approach that, what I would build and in what order, what I would charge, and what I need resolved before implementation begins.
+
+* My Understanding of the Project
+
+You are building a custom headless customer portal and content platform layered on top of your existing Shopify Plus, and want to investigate creating an additional TapCart stack. The platform has four feature modules: a digital pattern library, a gallery submission system, a blog comment system, and an online event system.
+
+The architectural core requirement --- and the one that shapes every other decision --- is platform independence. Shopify should remain the order and commerce record, but the application data layer must live in your own system, with Shopify customer IDs treated as external linked identifiers rather than primary keys. Every feature module, every customer record, every piece of community content must be portable.
+
+This requirement means that the database and API layer come first, Shopify integration is a connection layer on top, and all four modules are built against your own platform's data model.
+
+The four modules share infrastructure: a single internal user model, a shared comment component, a unified Klaviyo event pipeline, and a notification preference system. These cross-cutting systems need to be designed once and built correctly, not re-implemented per module.
+
+* Technical Approach
+
+** Stack Recommendation
+
+Your suggested stack direction is sound and I would follow it closely:
+
+- *Backend:* PostgreSQL for all application data. A single REST API serving both the web portal and TapCart.
+#+BEGIN_COMMENT
+NOTE: The "single API" part matters for TapCart. All four modules get their data from YOUR server, not Shopify. TapCart loads your custom features by calling your REST API via a WebView, same as the web portal does in a browser. Shopify is only contacted server-side for auth verification, fulfillment calls, and product catalog sync.
+#+END_COMMENT
+- *Webhook layer:* Dedicated listener service for Shopify order and fulfillment events, decoupled from the main API.
+#+BEGIN_COMMENT
+NOTE: Shopify sends HTTP POST payloads to a URL you register in the Shopify admin (e.g. POST /webhooks/shopify). Each request includes an HMAC-SHA256 signature computed using your webhook secret --- you verify this before processing any payload. "Decoupled from the main API" means the webhook handler is a separate route or process so a burst of incoming webhook events does not affect customer-facing API response times.
+#+END_COMMENT
+- *Klaviyo:* Event emission built into the service layer as a first-class concern, not bolted on at the controller level.
+#+BEGIN_COMMENT
+NOTE: Klaviyo's Track API is a simple HTTP POST: event name + customer email + a properties JSON object. "Service layer" means you create a thin KlaviyoService wrapper class with named methods (e.g. trackPatternPurchased, trackCommentReply) rather than scattering raw HTTP calls across your codebase. There will be roughly 15 distinct event types across all four modules, so this abstraction pays off quickly. It also makes Klaviyo easy to stub in tests.
+#+END_COMMENT
+- *File management:* All pattern file URLs stored as a managed field with a redirect/proxy layer, so the underlying host can change without breaking any customer's library access.
+#+BEGIN_COMMENT
+NOTE: Your download endpoint reads the file_url column from the DB and issues a 302 redirect. The customer's browser follows it to the actual hosted PDF. Since every download goes through your server first, changing the hosting location is just a DB field update. Customers and Klaviyo emails always use your stable /api/patterns/:id/download URL, never the hosted file URL directly.
+#+END_COMMENT
+- *Image storage:* S3-compatible object storage (S3 or Cloudflare R2) for gallery photo uploads, with server-side resizing and moderation at upload time rather than on delivery.
+#+BEGIN_COMMENT
+NOTE: This is specifically for Phase 3 gallery photos (user-submitted images), not the pattern PDFs. Your server receives multipart uploads, runs them through an image processing library (e.g. "sharp" for Node.js) to generate a display-size version and thumbnail, then uploads both to S3/R2. Cloudflare R2 is S3-API-compatible (same SDK, zero code change) but has zero egress fees vs S3's ~$0.09/GB, which matters for frequently served images.
+#+END_COMMENT
+
+** Addressing the Open Questions in the Brief
+
+The brief flags a number of specific technical decisions. Here are my positions on each.
+
+*File URL abstraction (Module 1):* I recommend storing a stable internal URL per pattern that proxies to the actual hosted file. This means the download link customers and Klaviyo emails receive never changes regardless of where the file is hosted. When you move hosting, you update one field in the admin panel. No order history breaks, no emails become invalid.
+
+*Historical order scan rate limits (Module 1):* Shopify's REST Admin API supports cursor-based pagination and allows up to 2 requests per second on Plus. For a large order history, I would run this as a background job with conservative pacing (well under the rate limit), checkpointing progress to the database so it can resume safely if interrupted. This is a one-time operation and does not need to be fast --- it needs to be reliable and auditable.
+
+*Auto-fulfill standalone patterns vs. mixed orders (Module 1):* Shopify's Fulfillment API supports fulfilling individual line items within an order. The correct approach is to create a fulfillment for only the digital line item, leaving the physical portion open. The pattern type flag on the pattern record controls whether this auto-fulfillment fires.
+
+*Notification preference storage (Module 2):* I recommend storing preferences in your own database and syncing them to Klaviyo as profile properties. This gives you the source of truth in your own system (portable, queryable, not dependent on Klaviyo's data model), while Klaviyo flows can branch on those properties at send time. You get the best of both: your own platform owns the record, Klaviyo owns the delivery logic.
+
+*TapCart push notification tokens (Module 2):* This is unresolved and needs to be verified with TapCart directly before the frontend architecture is finalized. See the TapCart section below.
+
+*Gallery widget injection (Module 3):* I recommend a Shopify Theme App Extension over script tag injection. Theme app extensions are the current Shopify standard for Shopify Plus, they are version-controlled, they respect the Online Store 2.0 section architecture, and they do not risk being blocked or delayed by theme load order. The gallery data is served from your API regardless --- the extension is only the mounting point.
+
+*Free event registration (Module 4):* I would keep free registrations entirely in your custom database. Creating a zero-dollar Shopify order adds operational noise with no benefit --- it does not improve reporting for free events and it couples your registration data to Shopify's order model unnecessarily, which cuts against your portability requirement.
+
+*VOD access expiry (Module 4):* Soft-hide is the right call. The data record is retained, the expiry timestamp is stored, and the UI simply does not render the link once the window passes. No data is deleted, access can be restored by updating the timestamp, and there are no edge cases around partially-cached access states.
+
+* TapCart: The Highest-Priority Unknown
+
+TapCart is the single largest architectural risk in this project. The brief calls out five open questions about TapCart compatibility, and until those questions are answered, the frontend architecture for all four modules cannot be finalized.
+
+The critical ones are:
+
+1. *Does TapCart support Shopify New Customer Accounts (passwordless auth)?* If it does not, you either need a workaround or you need to reconsider the auth architecture for the mobile surface entirely.
+#+BEGIN_COMMENT
+NOTE: Shopify New Customer Accounts (launched 2023) is Shopify's current default auth system --- passwordless, email OTP or magic link. TapCart was historically built against the older "classic" customer accounts (username + password). Whether TapCart has updated to support the new system must be verified directly. If it hasn't, mobile customers either can't log in, or you need a parallel mobile auth path that avoids New Customer Accounts entirely --- complicating the entire auth architecture.
+#+END_COMMENT
+2. *Can auth session context be passed into a WebView?* Single sign-on between TapCart and your custom platform is only possible if TapCart can pass a token or customer identifier into the WebView at load time. If it cannot, customers would need to authenticate separately in the WebView, which is a poor experience.
+#+BEGIN_COMMENT
+NOTE: TapCart can embed a WebView (an in-app browser) pointing at a URL on your platform. For SSO, TapCart needs to inject the customer's session token into that URL (e.g. as a query param or header) when loading the WebView. Your platform reads that token, verifies it with Shopify, and establishes a local session. If TapCart cannot do this injection, the customer lands on your platform unauthenticated and must log in again from scratch on every page load --- a broken UX.
+#+END_COMMENT
+3. *Does TapCart expose push notification device tokens to Klaviyo?* If TapCart manages push independently and does not expose tokens, your Klaviyo-centric push delivery plan may not work for mobile.
+#+BEGIN_COMMENT
+NOTE: Push notifications require a device token (a unique identifier for the customer's phone, issued by Apple/Google). TapCart manages these tokens internally for its own push system. For YOUR Klaviyo-routed notifications to reach mobile users, TapCart must expose those tokens to Klaviyo. If it manages push independently, you end up with two separate push pipelines (TapCart for commerce, Klaviyo for everything else) which creates a fragmented customer experience and duplicate notification logic.
+#+END_COMMENT
+4. *Which TapCart subscription would be required for this work, and how much exactly would it cost?* From preliminary research, it looks like the lower teir would not allow any custom integrations or design blocks. The next teir seems to allow for more customization, but still not enough to interface with non shopify databases. Enterprise may be the only option, and prices are not listed. We would need to nail this down.
+
+I would want these three questions answered before scoping any frontend work. They should be verified directly with TapCart support and documentation prior to Phase 0 completing. They do not block architecture design work, but they block frontend implementation planning.
+
+* Proposed Phase Structure
+
+#+ATTR_LATEX: :environment longtable :align >{\bfseries}p{1.8cm}p{3.5cm}p{7cm} :booktabs t
+| Phase | Module                        | Rationale                                                                                                                                                                   |
+|-------+-------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 0     | Architecture & Discovery      | Resolve all foundational technical decisions before writing a line of implementation code.                                                                                  |
+| 1     | Core Platform + Digital Library | The highest immediate value. Replaces two paid third-party apps, establishes the auth layer, customer DB, Klaviyo pipeline, and webhook infrastructure all subsequent phases depend on. |
+| 2     | Comment System                | The comment component is shared between blogs and gallery. Building it as a standalone phase first means gallery gets a finished, tested component rather than a rough one built inside the gallery scope. |
+| 3     | Gallery Submission System     | Depends on the comment component from Phase 2. Also benefits from the customer identity and Klaviyo infrastructure established in Phase 1.                                  |
+| 4     | Online Event System           | New capability with no legacy replacement pressure. Best built once the platform is stable and proven.                                                                      |
+
+* Phase 0 --- Architecture & Discovery
+
+** What This Phase Produces
+
+An implementation-ready technical specification covering every subsequent phase. The goal is to iron out major technical decisions before implementation work begins so that phases 1 through 4 can be built with less risk.
+
+** Scope
+
+- Internal user data model and Shopify identity linkage strategy
+#+BEGIN_COMMENT
+NOTE: Deciding the schema for your users table: your own UUID primary key, with Shopify's numeric customer ID stored as a non-primary indexed column. Key question: do you create the internal user record on-the-fly when a customer first authenticates, or do you need a migration strategy to pre-populate records for all existing Shopify customers before launch? This affects the launch sequencing plan.
+#+END_COMMENT
+- Data models for all four modules (patterns, comments, gallery submissions, events)
+#+BEGIN_COMMENT
+NOTE: The full table schema design for everything: columns, types, foreign keys, indexes, status enums. Critical constraint: every module's ownership rows (user_patterns, event_registrations, gallery_submissions) must reference your internal user ID, not the Shopify customer ID. This is what enforces the portability requirement at the database level.
+#+END_COMMENT
+- Auth architecture: Shopify New Customer Accounts integration, session design, TapCart SSO approach
+#+BEGIN_COMMENT
+NOTE: Shopify New Customer Accounts issues a session token after auth via email OTP or magic link. Your auth middleware chain: (1) receive that token from the frontend, (2) verify it against Shopify's API, (3) extract the Shopify customer ID, (4) look up or create the internal user record, (5) issue your own JWT for all subsequent API calls. The TapCart SSO approach depends on the TapCart question answers.
+#+END_COMMENT
+- API design: resource boundaries, endpoint structure, auth requirements, web + mobile contract
+#+BEGIN_COMMENT
+NOTE: Designing the actual endpoints: GET /api/me/library, POST /api/gallery/submissions, etc. Also deciding the auth scheme --- Bearer token in Authorization header is standard for an API consumed by both a browser app and a WebView. "Web + mobile contract" confirms these endpoints work identically for both surfaces so you don't maintain two versions.
+#+END_COMMENT
+- Shopify integration plan: Admin API, webhooks, fulfillment behavior per product type
+#+BEGIN_COMMENT
+NOTE: Shopify has two main APIs: the Admin API (server-side only, authenticated, used for orders/fulfillments/products) and the Storefront API (client-side safe, for storefront browsing). Your webhook listener and fulfillment calls both use the Admin API. This item covers: which webhook topics to subscribe to, what each payload looks like, and the exact Fulfillment API call sequence for digital vs. mixed orders.
+#+END_COMMENT
+- Klaviyo event pipeline design: event taxonomy, profile property schema, notification preference model
+#+BEGIN_COMMENT
+NOTE: Deciding the naming and data shape for every Klaviyo event: e.g. "Pattern Purchased" with properties {pattern_id, pattern_name, download_url}. Also deciding the Klaviyo profile property schema for notification preferences (e.g. notif_comment_reply_email: true) so Klaviyo flows can branch on them at delivery time without any code changes on your end.
+#+END_COMMENT
+- File and image hosting strategy
+#+BEGIN_COMMENT
+NOTE: Confirming the approach: PDFs stay in Shopify's media manager for now (your proxy abstraction sits in front), gallery images go to S3/R2 starting in Phase 3. Also deciding whether to use signed/expiring download URLs for PDF access (adds protection against link sharing) or plain 302 redirects.
+#+END_COMMENT
+- TapCart architecture decision (WebView vs. native blocks, pending TapCart answers)
+#+BEGIN_COMMENT
+NOTE: TapCart supports two models for custom content: (1) WebView --- loads a URL from your platform in an in-app browser; (2) Native custom blocks --- built to TapCart's own SDK. WebView is dramatically simpler; your platform is just a responsive web app. Native blocks require building TapCart-specific UI components separately from your web frontend. This decision affects every module's mobile delivery.
+#+END_COMMENT
+- Product catalog sync strategy for gallery
+#+BEGIN_COMMENT
+NOTE: The gallery submission form needs a live typeahead against the Shopify product catalog. You can't call Shopify's API on every keystroke, so you maintain a local synced copy in your own DB. This item designs that sync: which fields to store, how to handle product updates and discontinuation, and whether nightly full sync alone is sufficient or real-time webhook sync is needed.
+#+END_COMMENT
+- Known risks with recommended mitigations
+#+BEGIN_COMMENT
+NOTE: A structured document listing every technical unknown with a fallback approach if it doesn't resolve cleanly. E.g. "Risk: TapCart does not support New Customer Accounts auth. Mitigation: build a parallel auth flow for WebView that accepts a Shopify customer token passed as a URL parameter." Having this documented before implementation prevents ad-hoc scope creep mid-phase.
+#+END_COMMENT
+
+** Deliverables
+
+- Full data model / schema outline
+#+BEGIN_COMMENT
+NOTE: A SQL schema or ER diagram covering all tables across all four modules and the platform foundation. Should be complete enough that the database migrations can be written from it without ambiguity.
+#+END_COMMENT
+- API endpoint reference
+#+BEGIN_COMMENT
+NOTE: A document listing every planned endpoint: method, path, auth requirement, request shape, response shape. Doesn't need to be full OpenAPI spec, but enough to confirm the contract before implementation begins.
+#+END_COMMENT
+- Auth and identity strategy document
+#+BEGIN_COMMENT
+NOTE: A written description of the full auth flow: Shopify authentication to platform JWT issuance to session management to TapCart SSO. Prevents auth from being re-debated or re-decided during implementation.
+#+END_COMMENT
+- Integration strategy per subsystem
+#+BEGIN_COMMENT
+NOTE: One section per external system: Shopify Admin API, Shopify webhooks, Klaviyo, Smile.io, TapCart. Covers connection method, data flows, rate limits, and API key/auth approach.
+#+END_COMMENT
+- TapCart architecture recommendation (with TapCart questions resolved)
+#+BEGIN_COMMENT
+NOTE: The concrete output of resolving the TapCart open questions: a recommendation of WebView vs. native blocks, how auth context is passed, and how push notifications are routed. This is what unlocks frontend scoping for all four modules.
+#+END_COMMENT
+- Technical risk log with recommended approaches
+#+BEGIN_COMMENT
+NOTE: The completed risk register, each risk rated by likelihood/impact with a recommended mitigation.
+#+END_COMMENT
+- Phase 1--4 implementation scope, refined and confirmed
+#+BEGIN_COMMENT
+NOTE: After the architecture work is done, you will have a much clearer view of what each phase actually involves. This deliverable is an updated per-phase scope, potentially with revised estimates. The goal is that Phase 1 kickoff starts from a confirmed scope, not just an estimate.
+#+END_COMMENT
+
+** Estimate
+
+$4000 - $6000
+
+The range depends on how deeply we need to go on TapCart integration validation and how many open questions require direct vendor verification during this phase.
+
+* Phase 1 --- Core Platform & Digital Library
+
+** What Gets Built
+
+The backend foundation that every other phase depends on: the database, the API, the auth layer, the Shopify webhook pipeline, and the Klaviyo event infrastructure. On top of that foundation, the first customer-facing feature: the digital pattern library, replacing your current EDP and Uplinkly apps.
+
+** Scope
+
+*Platform Foundation*
+- PostgreSQL database setup and schema implementation (per Phase 0 design)
+#+BEGIN_COMMENT
+NOTE: Provisioning the database (on DigitalOcean, either on the main droplet or as a managed DB service at ~$15/mo extra) and running migrations from the Phase 0 schema. Nothing architecturally unusual here.
+#+END_COMMENT
+- REST API service
+#+BEGIN_COMMENT
+NOTE: Your own Node.js (or equivalent) application server. Not Shopify's API. Customers and the customer portal call this; your server then calls Shopify's Admin API server-side as needed (for auth verification, fulfillment calls, catalog sync). Shopify is never contacted directly by the browser or WebView.
+#+END_COMMENT
+- Auth layer: Shopify New Customer Accounts integration, internal session management
+#+BEGIN_COMMENT
+NOTE: Middleware on every authenticated request: reads the incoming Shopify session token (passed from the frontend after the customer authenticates via Shopify's passwordless flow), verifies it with Shopify's API, extracts the Shopify customer ID, looks up or creates the internal user record, issues your own JWT. All subsequent calls use your JWT. Conceptually the same as "Login with Google" --- Shopify is just the identity provider.
+#+END_COMMENT
+- Shopify webhook listener service (order created, order fulfilled, fulfillment updated)
+#+BEGIN_COMMENT
+NOTE: An HTTP endpoint registered in the Shopify admin. Shopify sends event payloads to it. You verify the HMAC-SHA256 signature before processing. Key events for the pattern library: orders/paid (payment cleared, trigger library grant and Klaviyo email) and fulfillments/create (used for auto-fulfilling digital line items). Shopify retries delivery with exponential backoff if your endpoint doesn't return HTTP 200 within the timeout.
+#+END_COMMENT
+- Klaviyo event emission service, integrated at the service layer
+#+BEGIN_COMMENT
+NOTE: A wrapper class around Klaviyo's Track API. Named methods like trackPatternPurchased(user, pattern) keep the rest of the codebase clean and the API key isolated. Your code fires and forgets; Klaviyo handles delivery. The wrapper also lets you easily stub Klaviyo calls in tests without mocking HTTP.
+#+END_COMMENT
+- Deployment infrastructure (hosting, environment configuration, CI pipeline)
+#+BEGIN_COMMENT
+NOTE: Nginx on DigitalOcean as reverse proxy: handles SSL via Let's Encrypt, routes API and webhook paths to your Node process. PM2 or systemd keeps the app alive and restarts on crash. GitHub Actions (or similar) runs tests and deploys on merge to main. API keys and secrets stored outside the codebase in environment variables.
+#+END_COMMENT
+
+*Digital Pattern Library*
+- Pattern records with file URL abstraction layer
+#+BEGIN_COMMENT
+NOTE: A patterns table with a file_url column. The download endpoint reads this and issues a 302 redirect. "Abstraction" means customers never get the actual hosted file URL directly --- everything flows through /api/patterns/:id/download. Admin updates file_url in the admin panel when the hosting location changes; no customer links break, no order history is invalidated.
+#+END_COMMENT
+- SKU-to-pattern mapping table and assignment logic
+#+BEGIN_COMMENT
+NOTE: A pattern_skus join table: (pattern_id, sku). One pattern maps to many SKUs (direct purchase, kit variant, bundle, legacy BigCommerce-imported SKUs). Assignment logic in the webhook handler: for each line item SKU in the incoming order, query pattern_skus. For each match, INSERT INTO user_patterns if the customer does not already own that pattern.
+#+END_COMMENT
+- Fulfillment logic: auto-fulfill digital line items, skip physical line items on mixed orders
+#+BEGIN_COMMENT
+NOTE: Shopify's Fulfillment API lets you create a fulfillment for specific line item IDs within an order, not the entire order. For a standalone digital pattern, POST to the Fulfillment API with just that line item's ID. Shopify marks it fulfilled; physical line items remain open for the warehouse. The pattern record's product_type flag (standalone vs. kit_component) controls whether this call fires at all.
+#+END_COMMENT
+- Historical order scan: background job to populate pattern libraries from existing Shopify order history
+#+BEGIN_COMMENT
+NOTE: A one-time script. Pages through all fulfilled Shopify orders using cursor-based pagination (Shopify returns a cursor in the Link response header). For each order, checks every line item SKU against pattern_skus. Inserts to user_patterns for matches. Runs at ~1 request/second to stay under the rate limit. Checkpoints progress to the DB so it resumes safely if interrupted. All grants written to an audit log. This is specifically how BigCommerce customers whose orders were migrated into Shopify get their pattern libraries restored on launch day.
+#+END_COMMENT
+- Customer dashboard: owned pattern library with download access
+#+BEGIN_COMMENT
+NOTE: A React page in the customer portal. GET /api/me/library returns the customer's user_patterns joined to patterns. UI renders each pattern with a name, thumbnail, and download button. The download button calls /api/patterns/:id/download --- server verifies ownership in the DB, reads file_url, issues the redirect. Customer never sees the actual hosted file URL.
+#+END_COMMENT
+- Admin panel: create/edit pattern records, manage file URLs, manage SKU mappings, manual assignment tool, view customer libraries, delivery receipt log
+#+BEGIN_COMMENT
+NOTE: A separate authenticated section of the frontend. Standard CRUD for patterns and pattern_skus. The manual assignment tool lets an admin look up a customer by email and add a pattern to their library directly --- covers edge cases the historical scan misses. The delivery receipt log records when each customer downloaded each pattern; useful for support queries.
+#+END_COMMENT
+- Klaviyo triggers: purchase confirmation with download link, pattern file updated notification
+#+BEGIN_COMMENT
+NOTE: Two Klaviyo events. "Pattern Purchased": fires when a user_patterns row is created, includes the download URL as a property. Klaviyo's transactional flow sends the confirmation email. "Pattern Updated": fires when admin updates a pattern's file_url. Your code queries all owners of that pattern and fires one Klaviyo event per customer. Klaviyo's flow sends the "your pattern has been updated, re-download here" notification.
+#+END_COMMENT
+
+** Outcome
+
+A live, working platform with a real customer database, a functioning auth layer, a Shopify integration pipeline, and the pattern library in production replacing your current digital download apps.
+
+** Estimate
+
+$20,000 -- $30,000
+
+The range reflects uncertainty in the historical order scan complexity (volume, error handling, edge cases) and the auth layer depth depending on TapCart findings from Phase 0.
+
+* Phase 2 --- Comment System
+
+** What Gets Built
+
+A Reddit-style threaded comment system designed as a shared, reusable component. It will be integrated into the blog in this phase, and dropped into the gallery system in Phase 3 without rework.
+
+** Scope
+
+*Comment Engine*
+- Threaded comment data model with reply depth support
+#+BEGIN_COMMENT
+NOTE: A comments table with a parent_id column (NULL for top-level, a comment_id for replies). The target entity (blog post or gallery submission) is stored as a polymorphic reference: target_type + target_id columns. This is what makes the component reusable --- gallery submissions pass target_type='gallery_submission' and their own ID as target_id. You can cap nesting depth (e.g. 2 levels) or allow infinite; worth confirming with the client.
+#+END_COMMENT
+- Upvote / downvote model
+#+BEGIN_COMMENT
+NOTE: A comment_votes table: (user_id, comment_id, value: +1 or -1) with a UNIQUE constraint on (user_id, comment_id) to prevent double-voting. A denormalized score column on comments is updated on each vote insert/update for fast reads, rather than aggregating votes on every query.
+#+END_COMMENT
+- Auto-approval for authenticated users; held queue for blocked users
+#+BEGIN_COMMENT
+NOTE: On comment insert, check users.status. If 'active': set comments.status='approved' immediately, visible in feed. If 'blocked': set comments.status='pending', invisible to other users, goes to moderation queue. The blocked user sees their comment as submitted but it never surfaces publicly --- they don't know they're blocked.
+#+END_COMMENT
+- User block and status flag (active / blocked) on customer record
+#+BEGIN_COMMENT
+NOTE: A status column on the users table. Admin sets it via the moderation interface. Every content submission path checks this flag. The column can be extended with more states later (shadowbanned, read-only, etc.) without changing the architecture.
+#+END_COMMENT
+
+*Notifications*
+- In-app notifications for replies and upvote thresholds (not per-upvote)
+#+BEGIN_COMMENT
+NOTE: A notifications table: (user_id, type, reference_id, read_at). Created server-side when a reply is posted (notify the parent comment's author) or when a comment's vote count crosses a threshold (e.g. 5, 10, 25 upvotes) --- not on every individual upvote, to avoid notification spam. The customer portal polls GET /api/me/notifications for unread badge count and list.
+#+END_COMMENT
+- Notification preference model: per-type toggles for email vs. push, stored in platform DB, synced to Klaviyo profile properties
+#+BEGIN_COMMENT
+NOTE: A user_notification_preferences table: (user_id, notification_type, email_enabled, push_enabled). For example, a customer can have comment_reply: email=true, push=false, independent of upvote notifications. On each preference change, your service syncs to Klaviyo as profile properties. Klaviyo flows read these at delivery time to decide whether to actually send each notification.
+#+END_COMMENT
+- Klaviyo triggers routing all notification events to email and push delivery
+#+BEGIN_COMMENT
+NOTE: When your server creates a notification record, it simultaneously fires a Klaviyo event. Klaviyo handles routing: email? push? both? neither? All that logic lives in Klaviyo flows, which the client configures without code deployments. This is the key benefit --- adding a new notification channel (SMS, etc.) requires zero code changes on your platform.
+#+END_COMMENT
+
+*Moderation*
+- Admin interface: review flagged content, manage user status, review blocked user comment queue
+#+BEGIN_COMMENT
+NOTE: A moderation dashboard in the admin panel. Shows comments with status='pending' (from blocked users) and comments flagged by other users. Admin can approve, delete, or escalate. Also shows a user list with block/unblock controls.
+#+END_COMMENT
+
+*Blog Integration*
+- Comment component integrated into Shopify blog post pages
+#+BEGIN_COMMENT
+NOTE: Shopify blog pages are rendered server-side from Liquid templates (Shopify's own templating language, similar conceptually to Jinja2). You inject a mounting div into the blog post Liquid template with a data attribute containing the article ID. Your React app mounts on this div, reads the attribute, and loads comments from your API.
+#+END_COMMENT
+- Shopify theme integration point (same approach as gallery widget: Theme App Extension)
+#+BEGIN_COMMENT
+NOTE: A Theme App Extension is Shopify's official mechanism for adding custom code to a Shopify theme without editing theme files directly. It's version-controlled, installable via the Shopify theme editor, and safe across theme updates. Even for a private/unlisted app used on only one store, you still package it as a Shopify app to use this mechanism. Directly editing theme Liquid files is fragile and unsupported practice on Shopify Plus.
+#+END_COMMENT
+
+** Outcome
+
+A fully functional comment system live on the blog, and a reusable backend + frontend component ready to be embedded in the gallery system in Phase 3 with no additional re-engineering.
+
+** Estimate
+
+$11,000 -- $16,000
+
+* Phase 3 --- Gallery Submission System
+
+** What Gets Built
+
+A custom gallery replacing the current Elfsight plugin and JotForm workflow, fully integrated with your Shopify product catalog and the comment system built in Phase 2.
+
+** Scope
+
+*Submission Flow*
+- Logged-in submission form: project name, pattern name/category, pattern link, project images (multi-upload), yarn selection with live product catalog typeahead (colorway to weight variant), project description, credit preference, social handle, contact email, marketing permission
+#+BEGIN_COMMENT
+NOTE: The interesting piece is the yarn typeahead. Customer types a partial colorway name; your frontend calls GET /api/catalog/search?q=... which runs a full-text search against your locally synced products table --- fast, no Shopify API rate limits. On selecting a colorway, the weight variant selector populates from your local product_variants table. The selected Shopify product_id and variant_id are stored on the submission row and used later by the product page widget.
+#+END_COMMENT
+- Image upload to S3/R2 with server-side resize and storage
+#+BEGIN_COMMENT
+NOTE: Multipart form upload. Your server receives the files, validates type and size, runs them through an image processing library (e.g. "sharp" for Node.js) to generate a display-size version and thumbnail, uploads both to S3/R2, and stores the resulting URLs on the gallery_submissions row. This happens before the submission enters the review queue, so admin always sees resized images.
+#+END_COMMENT
+- Submission enters pending status and admin review queue
+#+BEGIN_COMMENT
+NOTE: Unlike comments (which auto-approve for active users), all gallery submissions start as pending. This is a deliberate client decision --- editorial control over all gallery content before it goes public.
+#+END_COMMENT
+
+*Product Catalog Integration*
+- Shopify product catalog sync: webhook on new product creation + nightly full sync fallback
+#+BEGIN_COMMENT
+NOTE: You subscribe to Shopify's products/create and products/update webhook topics. When a new yarn colorway is added to Shopify, your local products and product_variants tables are updated in near real-time. The nightly full sync (a scheduled job paging through all Shopify products via the Admin API) catches any missed webhook events.
+#+END_COMMENT
+- Typeahead search against synced catalog; colorway selection populates weight variants
+#+BEGIN_COMMENT
+NOTE: All searches hit your own DB. This matters for performance (Shopify's API has latency and rate limits unsuitable for typeahead queries) and resilience (your typeahead keeps working even during a Shopify API outage).
+#+END_COMMENT
+- Submission tagged with Shopify product\_id and variant\_id
+#+BEGIN_COMMENT
+NOTE: These columns on gallery_submissions are the foreign key powering the product page widget. GET /api/gallery?product_id=XYZ returns all approved submissions tagged with that product. The variant_id enables future filtering by yarn weight without a schema change.
+#+END_COMMENT
+- Discontinued product handling: badge in gallery, link redirects to weight collection rather than suggesting color replacements
+#+BEGIN_COMMENT
+NOTE: When a Shopify product is archived, your product sync updates an is_discontinued flag in your local table. Submissions linked to a discontinued product show a "discontinued" badge in the gallery. Clicking the yarn name links to the weight collection page rather than a dead product page. Explicitly called out in the brief.
+#+END_COMMENT
+
+*Moderation & Status*
+- Admin review queue: approve (with optional edits) or deny (with reason comment)
+#+BEGIN_COMMENT
+NOTE: Admin sees all pending submissions. Can approve (optionally editing data before it goes live) or deny with a free-text reason stored on the record. Status change triggers a Klaviyo event either way.
+#+END_COMMENT
+- Klaviyo trigger on status change (pending to approved, pending to denied)
+#+BEGIN_COMMENT
+NOTE: Two Klaviyo events: "Gallery Submission Approved" and "Gallery Submission Denied" (with denial reason as a property). Customer gets notified either way --- better UX than the current JotForm workflow where customers likely hear nothing after submitting.
+#+END_COMMENT
+- Customer dashboard: submission status view with denial reason if applicable
+#+BEGIN_COMMENT
+NOTE: Shows all of the customer's submissions with current status. If denied, the denial reason is displayed so the customer understands why and can resubmit with corrections.
+#+END_COMMENT
+- Customer can delete their own submission
+#+BEGIN_COMMENT
+NOTE: A delete endpoint that verifies ownership. Soft delete recommended (set status='deleted', retain the row for audit). Removes from public gallery immediately.
+#+END_COMMENT
+
+*Gallery & Community Features*
+- Browse gallery: search and filter by colorway name, yarn weight, pattern category
+#+BEGIN_COMMENT
+NOTE: Server-side queries against your gallery_submissions table joined to your local product catalog data. You need indexes on the join columns. PostgreSQL's built-in full-text search (tsvector) works well for the colorway name search.
+#+END_COMMENT
+- Upvote on submissions
+#+BEGIN_COMMENT
+NOTE: A submission_votes table (user_id, submission_id) with a UNIQUE constraint. Denormalized vote_count on gallery_submissions. No downvote for gallery (unlike comments). Logged-in users only.
+#+END_COMMENT
+- Comment system embedded per submission (Phase 2 component)
+#+BEGIN_COMMENT
+NOTE: The payoff of building comments first. Gallery submissions pass target_type='gallery_submission' and their ID as target_id to the Phase 2 comment component. Zero additional backend work required.
+#+END_COMMENT
+- Notifications when someone comments on or upvotes a submission you made
+#+BEGIN_COMMENT
+NOTE: New notification types added to the Phase 2 infrastructure: "Gallery Comment Received" and "Gallery Upvote Threshold." Same notifications table, same Klaviyo event pattern, same preference model. No new infrastructure.
+#+END_COMMENT
+
+*Product Page Integration*
+- Side-scroll gallery widget on Shopify product pages showing top-rated submissions tagged with that product
+#+BEGIN_COMMENT
+NOTE: A horizontally scrollable React component on Shopify product pages. Calls GET /api/gallery?product_id=SHOPIFY_PRODUCT_ID&sort=votes&limit=10. The product ID is injected into the widget's mounting div via Liquid at page render time (Liquid knows the current product's ID). Your widget JavaScript reads the data attribute and calls your API.
+#+END_COMMENT
+- Implemented as a Theme App Extension; data served from platform API
+#+BEGIN_COMMENT
+NOTE: The Theme App Extension is a Liquid snippet that renders a mounting div (with data-product-id attribute) plus a script tag loading your widget bundle. Installed once via the Shopify theme editor, applies to all product pages automatically. Shopify does the Liquid rendering; your widget handles the API call and UI. Gallery data never touches Shopify.
+#+END_COMMENT
+
+** Outcome
+
+A custom gallery system in production, replacing Elfsight and JotForm, surfacing community content on product pages, and integrated with your product catalog.
+
+** Estimate
+
+$16,000 -- $24,000
+
+The range reflects the product catalog integration complexity and the product page widget, which involves Shopify theme work and carries some variability depending on your current theme structure.
+
+* Phase 4 --- Online Event System
+
+** What Gets Built
+
+A custom event registration and delivery system for online workshops, seminars, and guest speaker events, integrated with Shopify for paid ticketing and your Klaviyo pipeline for all customer communications.
+
+** Scope
+
+*Event Management*
+- Admin event creation: title, description, schedule, speaker info, capacity (with default), ticket price (or free), video link field (manually entered Zoom or equivalent link)
+#+BEGIN_COMMENT
+NOTE: Standard CRUD for an events table. The video link is a plain text field --- admin creates the Zoom meeting separately and pastes the URL in. No Zoom API integration. Capacity is an integer column; registration is blocked once the count of event_registrations for that event reaches it.
+#+END_COMMENT
+- Post-event: admin uploads VOD link and thumbnail with optional expiry date
+#+BEGIN_COMMENT
+NOTE: After the event, admin opens the event record and adds a vod_url (e.g. a YouTube/Vimeo unlisted video URL) and an optional vod_expiry timestamp. The customer dashboard uses these to conditionally render or hide the VOD section. Data is never deleted.
+#+END_COMMENT
+
+*Registration*
+- Free events: one-click registration for logged-in customers
+#+BEGIN_COMMENT
+NOTE: POST /api/events/:id/register. Server checks: user is authenticated, capacity not reached, user not already registered. If all pass, inserts event_registrations row and fires the Klaviyo confirmation event. Straightforward.
+#+END_COMMENT
+- Paid events: registration triggers Shopify checkout; confirmation on order fulfillment webhook
+#+BEGIN_COMMENT
+NOTE: Each paid event has a corresponding Shopify product (a ticket product, created manually in Shopify). Clicking "Register" redirects the customer to Shopify checkout. When they complete purchase, the orders/paid webhook fires on your listener (same Phase 1 infrastructure). Your webhook handler creates the event_registrations row and fires the Klaviyo confirmation. No new infrastructure needed.
+#+END_COMMENT
+- Capacity enforcement with configurable cap per event
+#+BEGIN_COMMENT
+NOTE: There is a race condition: two customers registering simultaneously when one slot remains could both pass the capacity check before either transaction commits. The safe solution is a database-level lock: use SELECT FOR UPDATE on the event row within a transaction, or an atomic counter with a constraint. Without this you will over-enroll.
+#+END_COMMENT
+- Rate-limiting per account as secondary spam protection
+#+BEGIN_COMMENT
+NOTE: Since Shopify account login is the primary gate, the rate limit just needs to be light (e.g. max 5 registration attempts per account per hour). Implemented in API middleware. Can be stored in a DB table or Redis if added.
+#+END_COMMENT
+- Klaviyo trigger on registration: confirmation (email + push)
+#+BEGIN_COMMENT
+NOTE: "Event Registration Confirmed" Klaviyo event with properties: event title, event date as ISO timestamp, speaker name, event_id. The event_date property is what enables Klaviyo's time-based reminder flows --- Klaviyo can trigger "send 1 day before event_date" entirely within their flow builder, with zero additional code on your end.
+#+END_COMMENT
+- Klaviyo-driven reminder flow leading up to event
+#+BEGIN_COMMENT
+NOTE: This is NOT a code task. It is a Klaviyo flow the client configures themselves in Klaviyo's flow builder. Your only responsibility is that the event_date is present as an ISO timestamp in the Klaviyo event payload at registration time. Klaviyo handles the time-delay trigger logic.
+#+END_COMMENT
+
+*Customer Dashboard*
+- Registered events listed with event details, schedule, speaker info
+#+BEGIN_COMMENT
+NOTE: GET /api/me/events returns the customer's event_registrations joined to events. Standard list/card UI.
+#+END_COMMENT
+- Zoom link surfaces in dashboard within a defined pre-event window
+#+BEGIN_COMMENT
+NOTE: The API only includes the live_link field in the response if the current timestamp is within a configured window before the event start time (e.g. 30 minutes). Outside that window, the field is omitted from the response entirely. Prevents link sharing or premature access.
+#+END_COMMENT
+- Post-event: VOD link and thumbnail displayed while within access window
+#+BEGIN_COMMENT
+NOTE: Conditional API response: if event_end_time < now AND (vod_expiry IS NULL OR vod_expiry > now), include vod_url and thumbnail. After expiry, those fields are absent from the response. No separate "is_expired" flag needed --- the timestamps are the truth.
+#+END_COMMENT
+- VOD expiry: soft-hide (link stops rendering when expiry timestamp passes, data retained, timestamp updateable by admin)
+#+BEGIN_COMMENT
+NOTE: The vod_url and vod_expiry stay in the DB permanently. The conditional response logic handles the visibility. Admin extends access by updating vod_expiry in the admin panel. No data is deleted; no access is revoked at the hosting level unless the client also removes the video from YouTube/Vimeo separately.
+#+END_COMMENT
+- Notification when VOD is posted for an event the customer attended
+#+BEGIN_COMMENT
+NOTE: When admin saves a VOD URL to an event record, your API fires a Klaviyo event: "Event VOD Available." Since you need to notify all registered attendees, your code runs: SELECT user_id FROM event_registrations WHERE event_id = ? and fires one Klaviyo event per customer. Klaviyo delivers per each customer's notification preferences.
+#+END_COMMENT
+
+** Out of Scope for This Phase
+
+- Premium VOD packages and access tier gating (flagged in brief as future scope: agreed, best handled once the base system is running)
+#+BEGIN_COMMENT
+NOTE: The brief mentioned a future upsell: a purchasable tier that unlocks all past event recordings. This requires an access_tier column on the users table and gating logic on VOD endpoints. Not complex to add later, but needs the base event system running first. Worth leaving a nullable access_tier column on users in the Phase 1 schema so it doesn't require a migration later.
+#+END_COMMENT
+- Zoom API integration (not needed; link is a manually entered field)
+#+BEGIN_COMMENT
+NOTE: Zoom has an API that could auto-create meetings when you create events. The brief explicitly does not want this. Admin creates the Zoom meeting manually and pastes the link in. Keeps scope clean and removes a dependency on Zoom's API pricing and terms.
+#+END_COMMENT
+
+** Estimate
+
+$11,000 -- $17,000
+
+* Pricing Summary
+
+#+ATTR_LATEX: :environment longtable :align >{\bfseries}p{3.5cm}p{4.5cm}rr :booktabs t
+| Phase | Description                     | Low Estimate | High Estimate |
+|-------+---------------------------------+--------------+---------------|
+|     0 | Architecture & Discovery        | $4,000       | $6,000        |
+|     1 | Core Platform + Digital Library | $20,000      | $30,000       |
+|     2 | Comment System                  | $11,000      | $16,000       |
+|     3 | Gallery Submission System       | $16,000      | $24,000       |
+|     4 | Online Event System             | $11,000      | $17,000       |
+|-------+---------------------------------+--------------+---------------|
+|       | *Total*                         | *$62,000*    | *$93,000*     |
+
+All estimates are fixed-price per phase, scoped to the deliverables described above. Scope changes or additions during a phase are handled as separate line items with a written change request before work begins.
+
+Phases are priced independently. You can choose to proceed with all four phases or stop after any phase. The platform foundation built in Phase 1 has value regardless of which subsequent modules are built.
+
+Phase 1 is the only phase with a true dependency: everything else depends on it. Phases 2, 3, and 4 can technically run in parallel once Phase 1 is complete, but I recommend sequential delivery to keep scope clean and allow feedback from each phase to inform the next.
+
+* Payment Structure
+
+I propose splitting each phase into three milestone payments:
+
+- 40% on phase kickoff
+#+BEGIN_COMMENT
+NOTE: Standard freelance practice. Covers your time investment at the start before any deliverables exist. Also confirms the client is committed before you begin.
+#+END_COMMENT
+- 40% on completion of a functional staging build
+#+BEGIN_COMMENT
+NOTE: Client can test the feature before it goes to production. Ties the second payment to something demonstrable, not just time spent. Gives the client a meaningful review window.
+#+END_COMMENT
+- 20% on production delivery and handoff
+#+BEGIN_COMMENT
+NOTE: Intentionally the smallest payment. Most work is done and paid for by this point. The small final payment keeps the client incentivized to provide timely feedback on the staging build rather than leaving it sitting.
+#+END_COMMENT
+
+* What I Would Need Before Phase 0
+
+- Confirmation of the four TapCart questions (or agreement to resolve them during Phase 0)
+#+BEGIN_COMMENT
+NOTE: Either the client has confirmed answers from TapCart already, or they explicitly agree that resolving these questions is in-scope for Phase 0. You cannot finalize the frontend architecture without this. It should be a concrete written commitment, not left as "we'll figure it out."
+#+END_COMMENT
+- Access to Klaviyo (API key and a sandbox account if available)
+#+BEGIN_COMMENT
+NOTE: Klaviyo's Private API key is needed to call the Track API (emitting events) and the Profiles API (syncing notification preferences). A sandbox account lets you test event emission without sending real emails to real customers. If no sandbox, test against the live account using clearly labeled test customer records.
+#+END_COMMENT
+- Access to Smile.io (API key and a sandbox account if available)
+- Any revisions to scope or features above
+
+* About Me (with regards to this type of work)
+
+I currently lead the design and delivery of production systems involving custom backend infrastructure, multi-system integrations, and complex application data 
+models. My background is more in systems architecture rather than agency-style web work, which is exactly why I am reading this brief as a platform design problem rather than a list of Shopify features.
+
+I am new to the Shopify ecosystem specifically, but the kind of system described in this brief - independent data layer, integration connectors, event pipelines, multi-surface delivery - is the type of work I do day to day.
+
+I will be transparent about what I know and what I need to verify. The TapCart questions I raised in this proposal are an example of that: I am not going to guess at the answers and build toward the wrong architecture.
+
+* Timeline
+
+** Assumptions (so the numbers make sense)
+- Single lead engineer + light client involvement for reviews/approvals.
+- Each phase includes: build → staging → client test window → fixes → production.
+- No major re-scope mid-phase
+- TapCart work is /architectural gating/ but actual TapCart implementation effort is embedded across phases depending on WebView vs native blocks
+
+** Phase 0 — Architecture & Discovery
+- *4-6 weeks*
+
+** Phase 1 — Core Platform + Digital Library
+Primary drivers: auth + Shopify webhooks/fulfillment + historical order scan reliability + admin tools.
+- *12–16 weeks*
+  - Lower end if: New Customer Accounts integration is straightforward, order history scan is clean, admin panel is minimal.
+  - Upper end if: auth needs a workaround for TapCart, order history has edge cases, or you need deeper audit/support tooling.
+
+** Phase 2 — Comment System
+Primary drivers: threading + voting + moderation + Shopify blog embedding via theme app extension + notifications.
+- *6–8 weeks*
+
+** Phase 3 — Gallery Submission System
+Primary drivers: image upload pipeline + moderation queue + catalog sync (webhooks + nightly) + product page widget + embedding comments.
+- *8–12 weeks*
+
+** Phase 4 — Online Event System
+Primary drivers: paid registration via Shopify, capacity/race-condition handling, dashboard gating windows, VOD logic, Klaviyo triggers.
+- *6–8 weeks*
+
+** Roll-up timelines
+- *Total: ~36–50 weeks* (≈ *9–12 months*)
+
+* Next Steps
+
+- Confirm the phase structure and any priority changes
+- Walk through the TapCart open questions and agree on how they will be resolved
+- Align on the Phase 0 deliverables and what level of detail is needed
+
+From there, Phase 0 can begin immediately. Phase 1 follows once the architecture documents are signed off.
