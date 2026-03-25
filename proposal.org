@@ -15,9 +15,11 @@
 #+LATEX_HEADER: \usepackage{helvet}
 #+LATEX_HEADER: \usepackage{booktabs}
 #+LATEX_HEADER: \usepackage{longtable}
+#+LATEX_HEADER: \usepackage{tabularx}
 #+LATEX_HEADER: \usepackage{array}
 #+LATEX_HEADER: \usepackage{colortbl}
 #+LATEX_HEADER: \renewcommand{\familydefault}{\sfdefault}
+#+LATEX_HEADER: \renewcommand{\arraystretch}{1.6}
 
 #+LATEX_HEADER: \definecolor{accent}{RGB}{31, 78, 121}
 #+LATEX_HEADER: \definecolor{lightgray}{RGB}{245, 245, 245}
@@ -38,15 +40,15 @@
 
 Thanks for the platform brief. I have read it in full, including the open questions sections at the end of each module.
 
-My overall read: this is not a Shopify customization project. It is a purpose-built application platform that uses Shopify as a commerce engine and integration point. The scope, the identity architecture, the Klaviyo event pipeline, the four feature modules, and the TapCart delivery requirements all point to a system that needs to be designed and built as a platform from the ground up.
+My overall read: this is not a Shopify customization project. It is a purpose-built application platform layer that sits on top of Shopify as a commerce engine and integration point. The scope, the identity architecture, the Klaviyo event pipeline, the four feature modules, and the TapCart delivery requirements all point to a system that needs to be designed and built as a platform from the ground up.
 
 This proposal outlines how I would approach that, what I would build and in what order, what I would charge, and what I need resolved before implementation begins.
 
 * My Understanding of the Project
 
-You are building a custom headless customer portal and content platform layered on top of your existing Shopify Plus, and want to investigate creating an additional TapCart stack. The platform has four feature modules: a digital pattern library, a gallery submission system, a blog comment system, and an online event system.
+You are building a custom customer portal and content platform layered on top of your existing Shopify Plus, and want to investigate creating an additional TapCart stack. The platform has four feature modules: a digital pattern library, a gallery submission system, a blog comment system, and an online event system.
 
-The architectural core requirement --- and the one that shapes every other decision --- is platform independence. Shopify should remain the order and commerce record, but the application data layer must live in your own system, with Shopify customer IDs treated as external linked identifiers rather than primary keys. Every feature module, every customer record, every piece of community content must be portable.
+The architectural core requirement, and the one that shapes every other decision, is platform independence. Shopify should remain the order and commerce record, but the application data layer must live in your own system, with Shopify customer IDs treated as external linked identifiers rather than primary keys. Every feature module, every customer record, every piece of community content must be portable.
 
 This requirement means that the database and API layer come first, Shopify integration is a connection layer on top, and all four modules are built against your own platform's data model.
 
@@ -83,7 +85,7 @@ NOTE: This is specifically for Phase 3 gallery photos (user-submitted images), n
 
 The brief flags a number of specific technical decisions. Here are my positions on each.
 
-*File URL abstraction (Module 1):* I recommend storing a stable internal URL per pattern that proxies to the actual hosted file. This means the download link customers and Klaviyo emails receive never changes regardless of where the file is hosted. When you move hosting, you update one field in the admin panel. No order history breaks, no emails become invalid.
+*File URL abstraction (Module 1):* I recommend storing a stable internal URL per pattern that proxies to the actual hosted file. This means the download link customers receive (and that are embedded in Klaviyo emails) never change regardless of where the file is hosted. When you move hosting, you update one field in the admin panel. No order history breaks, no emails become invalid.
 
 *Historical order scan rate limits (Module 1):* Shopify's REST Admin API supports cursor-based pagination and allows up to 2 requests per second on Plus. For a large order history, I would run this as a background job with conservative pacing (well under the rate limit), checkpointing progress to the database so it can resume safely if interrupted. This is a one-time operation and does not need to be fast --- it needs to be reliable and auditable.
 
@@ -99,11 +101,17 @@ The brief flags a number of specific technical decisions. Here are my positions 
 
 *VOD access expiry (Module 4):* Soft-hide is the right call. The data record is retained, the expiry timestamp is stored, and the UI simply does not render the link once the window passes. No data is deleted, access can be restored by updating the timestamp, and there are no edge cases around partially-cached access states.
 
-* TapCart: The Highest-Priority Unknown
+* TapCart: Mobile App Delivery
 
-TapCart is the single largest architectural risk in this project. The brief calls out five open questions about TapCart compatibility, and until those questions are answered, the frontend architecture for all four modules cannot be finalized.
+Implementing TapCart is both a setup and integration project: standing up the mobile app itself (plan selection, branding, App Store submission, base Shopify catalog), and then connecting each custom platform feature module to the app surface across Phases 1--4.
 
-The critical ones are:
+This work falls into two layers:
+
+1. *TapCart app foundation* - account setup, app branding, navigation structure, Shopify catalog integration, App Store and Play Store submission. This is configuration and coordination work, not backend engineering, but it has real scope and takes effort to accomplish.
+
+2. *Custom feature integration* - surfacing the pattern library, gallery, comments, and event system inside TapCart, via WebView or native blocks. This integration work is embedded across Phases 1--4.
+
+TapCart remains the highest architectural risk because several questions must be resolved before the integration architecture can be finalized. The critical ones are:
 
 1. *Does TapCart support Shopify New Customer Accounts (passwordless auth)?* If it does not, you either need a workaround or you need to reconsider the auth architecture for the mobile surface entirely.
 #+BEGIN_COMMENT
@@ -117,20 +125,20 @@ NOTE: TapCart can embed a WebView (an in-app browser) pointing at a URL on your 
 #+BEGIN_COMMENT
 NOTE: Push notifications require a device token (a unique identifier for the customer's phone, issued by Apple/Google). TapCart manages these tokens internally for its own push system. For YOUR Klaviyo-routed notifications to reach mobile users, TapCart must expose those tokens to Klaviyo. If it manages push independently, you end up with two separate push pipelines (TapCart for commerce, Klaviyo for everything else) which creates a fragmented customer experience and duplicate notification logic.
 #+END_COMMENT
-4. *Which TapCart subscription would be required for this work, and how much exactly would it cost?* From preliminary research, it looks like the lower teir would not allow any custom integrations or design blocks. The next teir seems to allow for more customization, but still not enough to interface with non shopify databases. Enterprise may be the only option, and prices are not listed. We would need to nail this down.
+4. *Which TapCart subscription tier is required, and what does it cost?* Lower tiers likely do not support custom integrations or WebView with session injection. Enterprise may be the only viable option, and prices are not listed publicly. This must be confirmed before any TapCart work begins.
 
-I would want these three questions answered before scoping any frontend work. They should be verified directly with TapCart support and documentation prior to Phase 0 completing. They do not block architecture design work, but they block frontend implementation planning.
+All four questions must be verified directly with TapCart support during Phase 0. They do not block architecture design work, but they block frontend implementation planning and the TapCart app foundation work in Phase 1.
 
 * Proposed Phase Structure
 
-#+ATTR_LATEX: :environment longtable :align >{\bfseries}p{1.8cm}p{3.5cm}p{7cm} :booktabs t
-| Phase | Module                        | Rationale                                                                                                                                                                   |
-|-------+-------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 0     | Architecture & Discovery      | Resolve all foundational technical decisions before writing a line of implementation code.                                                                                  |
-| 1     | Core Platform + Digital Library | The highest immediate value. Replaces two paid third-party apps, establishes the auth layer, customer DB, Klaviyo pipeline, and webhook infrastructure all subsequent phases depend on. |
-| 2     | Comment System                | The comment component is shared between blogs and gallery. Building it as a standalone phase first means gallery gets a finished, tested component rather than a rough one built inside the gallery scope. |
-| 3     | Gallery Submission System     | Depends on the comment component from Phase 2. Also benefits from the customer identity and Klaviyo infrastructure established in Phase 1.                                  |
-| 4     | Online Event System           | New capability with no legacy replacement pressure. Best built once the platform is stable and proven.                                                                      |
+#+ATTR_LATEX: :environment tabularx :width \linewidth :align >{\bfseries}p{1.8cm}p{3.5cm}X :booktabs t
+| Phase | Module                          | Rationale                                                                                                                                                                                                  |
+|-------+---------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+|     0 | Architecture & Discovery        | Resolve all foundational technical decisions before writing a line of implementation code.                                                                                                                 |
+|     1 | Core Platform + Digital Library | The highest immediate value. Replaces two paid third-party apps, establishes the auth layer, customer DB, Klaviyo pipeline, and webhook infrastructure all subsequent phases depend on.                    |
+|     2 | Comment System                  | The comment component is shared between blogs and gallery. Building it as a standalone phase first means gallery gets a finished, tested component rather than a rough one built inside the gallery scope. |
+|     3 | Gallery Submission System       | Depends on the comment component from Phase 2. Also benefits from the customer identity and Klaviyo infrastructure established in Phase 1.                                                                 |
+|     4 | Online Event System             | New capability with no legacy replacement pressure. Best built once the platform is stable and proven.                                                                                                     |
 
 * Phase 0 --- Architecture & Discovery
 
@@ -168,6 +176,10 @@ NOTE: Deciding the naming and data shape for every Klaviyo event: e.g. "Pattern 
 #+BEGIN_COMMENT
 NOTE: Confirming the approach: PDFs stay in Shopify's media manager for now (your proxy abstraction sits in front), gallery images go to S3/R2 starting in Phase 3. Also deciding whether to use signed/expiring download URLs for PDF access (adds protection against link sharing) or plain 302 redirects.
 #+END_COMMENT
+- TapCart plan selection: evaluate tier options, confirm which plan supports WebView with session injection and custom database integrations, provide a cost/capability recommendation
+#+BEGIN_COMMENT
+NOTE: TapCart has multiple subscription tiers. Lower tiers may not support custom integrations or design blocks at all. Enterprise may be required for full WebView and custom data integration, with pricing only available through TapCart sales directly. This research is a hard prerequisite --- the wrong plan selection could lock you out of the integration architecture entirely.
+#+END_COMMENT
 - TapCart architecture decision (WebView vs. native blocks, pending TapCart answers)
 #+BEGIN_COMMENT
 NOTE: TapCart supports two models for custom content: (1) WebView --- loads a URL from your platform in an in-app browser; (2) Native custom blocks --- built to TapCart's own SDK. WebView is dramatically simpler; your platform is just a responsive web app. Native blocks require building TapCart-specific UI components separately from your web frontend. This decision affects every module's mobile delivery.
@@ -199,9 +211,13 @@ NOTE: A written description of the full auth flow: Shopify authentication to pla
 #+BEGIN_COMMENT
 NOTE: One section per external system: Shopify Admin API, Shopify webhooks, Klaviyo, Smile.io, TapCart. Covers connection method, data flows, rate limits, and API key/auth approach.
 #+END_COMMENT
+- TapCart plan and setup recommendation
+#+BEGIN_COMMENT
+NOTE: A written recommendation covering which TapCart subscription tier to purchase, estimated ongoing subscription cost, and rationale. Delivered before any TapCart account is created so the client can make an informed purchasing decision. Note: the TapCart subscription cost is an ongoing expense borne by the client and is not included in any phase estimate.
+#+END_COMMENT
 - TapCart architecture recommendation (with TapCart questions resolved)
 #+BEGIN_COMMENT
-NOTE: The concrete output of resolving the TapCart open questions: a recommendation of WebView vs. native blocks, how auth context is passed, and how push notifications are routed. This is what unlocks frontend scoping for all four modules.
+NOTE: The concrete output of resolving the TapCart open questions: a recommendation of WebView vs. native blocks, how auth context is passed, and how push notifications are routed. This is what unlocks frontend scoping for all four modules and the Phase 1 TapCart app foundation work.
 #+END_COMMENT
 - Technical risk log with recommended approaches
 #+BEGIN_COMMENT
@@ -214,7 +230,7 @@ NOTE: After the architecture work is done, you will have a much clearer view of 
 
 ** Estimate
 
-$4000 - $6000
+$5000 - $7000
 
 The range depends on how deeply we need to go on TapCart integration validation and how many open questions require direct vendor verification during this phase.
 
@@ -282,15 +298,45 @@ NOTE: A separate authenticated section of the frontend. Standard CRUD for patter
 NOTE: Two Klaviyo events. "Pattern Purchased": fires when a user_patterns row is created, includes the download URL as a property. Klaviyo's transactional flow sends the confirmation email. "Pattern Updated": fires when admin updates a pattern's file_url. Your code queries all owners of that pattern and fires one Klaviyo event per customer. Klaviyo's flow sends the "your pattern has been updated, re-download here" notification.
 #+END_COMMENT
 
+*TapCart Mobile App Foundation*
+- TapCart account provisioning and plan setup
+#+BEGIN_COMMENT
+NOTE: Creating the TapCart account under the client's Shopify store, activating the correct subscription tier (per Phase 0 recommendation), and connecting TapCart to the Shopify store. This is the prerequisite for all subsequent TapCart configuration. The client will own the TapCart subscription; this line item covers the setup and configuration work.
+#+END_COMMENT
+- App branding: icon, splash screen, color palette, typography
+#+BEGIN_COMMENT
+NOTE: TapCart's app builder allows configuring visual identity. The client will need to provide brand assets (logo, color codes, font choices). This step produces the branded shell that the App Store and Play Store submissions use.
+#+END_COMMENT
+- Navigation structure and home page layout
+#+BEGIN_COMMENT
+NOTE: Configuring the app's tab bar, navigation hierarchy, and home page content blocks within TapCart's builder. Covers the standard Shopify commerce surface: product catalog, collections, cart, account. The custom feature modules are not yet integrated at this stage.
+#+END_COMMENT
+- Base Shopify catalog integration: products, collections, cart, checkout
+#+BEGIN_COMMENT
+NOTE: TapCart handles standard Shopify commerce out of the box. This step confirms catalog browsing, product detail pages, add-to-cart, and Shopify checkout all function correctly inside the app. This is verification and configuration, not custom development.
+#+END_COMMENT
+- App Store and Google Play Store submission
+#+BEGIN_COMMENT
+NOTE: TapCart manages the app binary build. This step covers: setting up Apple Developer and Google Play developer accounts (if not already active), providing required metadata (app name, description, screenshots, privacy policy URL), and submitting for review. Apple review typically takes 1-3 days; Play Store is usually faster. The client will need to own the developer accounts; annual developer account fees are not included in this estimate.
+#+END_COMMENT
+- Pattern library accessible inside TapCart via authenticated WebView
+#+BEGIN_COMMENT
+NOTE: The first custom feature integration. TapCart loads a WebView pointing at the pattern library page on your platform. Auth context (the customer's session token) is passed from TapCart into the WebView URL at load time. Your platform reads the token, verifies it, and establishes a session so the customer sees their own library without a separate login step. This is the integration pattern that all subsequent phases follow.
+#+END_COMMENT
+- Push notification foundation: Klaviyo-to-TapCart push routing confirmed and tested
+#+BEGIN_COMMENT
+NOTE: Validating the push notification architecture resolved in Phase 0. If TapCart exposes device tokens to Klaviyo, this step confirms the pipeline works end-to-end with a real test notification. If TapCart manages push independently, this step establishes and tests the dual-pipeline approach. Either way, push delivery must be confirmed before Phase 2 notification work begins.
+#+END_COMMENT
+
 ** Outcome
 
 A live, working platform with a real customer database, a functioning auth layer, a Shopify integration pipeline, and the pattern library in production replacing your current digital download apps.
 
 ** Estimate
 
-$20,000 -- $30,000
+$26,000 -- $38,000
 
-The range reflects uncertainty in the historical order scan complexity (volume, error handling, edge cases) and the auth layer depth depending on TapCart findings from Phase 0.
+The range reflects uncertainty in the historical order scan complexity (volume, error handling, edge cases), the auth layer depth depending on TapCart findings from Phase 0, and the TapCart app foundation work (branding, App Store submission, base catalog verification, and WebView integration for the pattern library). TapCart subscription costs and App Store developer account fees are not included and are ongoing costs borne by the client.
 
 * Phase 2 --- Comment System
 
@@ -348,13 +394,25 @@ NOTE: Shopify blog pages are rendered server-side from Liquid templates (Shopify
 NOTE: A Theme App Extension is Shopify's official mechanism for adding custom code to a Shopify theme without editing theme files directly. It's version-controlled, installable via the Shopify theme editor, and safe across theme updates. Even for a private/unlisted app used on only one store, you still package it as a Shopify app to use this mechanism. Directly editing theme Liquid files is fragile and unsupported practice on Shopify Plus.
 #+END_COMMENT
 
+*TapCart Integration*
+- Blog comment section accessible inside TapCart via WebView
+#+BEGIN_COMMENT
+NOTE: TapCart loads the blog post page in a WebView. Since the comment component is already mounted on the blog page via the Theme App Extension, it surfaces inside TapCart automatically. The main integration work is confirming that the authenticated session established in Phase 1 carries through so the customer can post comments without a separate login.
+#+END_COMMENT
+- In-app notification delivery confirmed for comment reply and upvote threshold events
+#+BEGIN_COMMENT
+NOTE: Validating that the Klaviyo-routed push notifications established in Phase 1 reach TapCart users correctly for the new notification types introduced in this phase. This is testing and validation work, not new infrastructure.
+#+END_COMMENT
+
 ** Outcome
 
 A fully functional comment system live on the blog, and a reusable backend + frontend component ready to be embedded in the gallery system in Phase 3 with no additional re-engineering.
 
 ** Estimate
 
-$11,000 -- $16,000
+$12,000 -- $18,000
+
+The TapCart integration for this phase is primarily validation work since the WebView session infrastructure is established in Phase 1.
 
 * Phase 3 --- Gallery Submission System
 
@@ -442,15 +500,29 @@ NOTE: A horizontally scrollable React component on Shopify product pages. Calls 
 NOTE: The Theme App Extension is a Liquid snippet that renders a mounting div (with data-product-id attribute) plus a script tag loading your widget bundle. Installed once via the Shopify theme editor, applies to all product pages automatically. Shopify does the Liquid rendering; your widget handles the API call and UI. Gallery data never touches Shopify.
 #+END_COMMENT
 
+*TapCart Integration*
+- Gallery browse and submission flow accessible inside TapCart via WebView
+#+BEGIN_COMMENT
+NOTE: The gallery pages on your platform are responsive web pages. TapCart loads them in a WebView with the authenticated session established in Phase 1. Submission form, image upload, and browsing all function as on the web surface. The main validation work is confirming that multi-image upload from mobile (camera roll access) works correctly inside a WebView.
+#+END_COMMENT
+- Product page gallery widget behaviour inside TapCart confirmed
+#+BEGIN_COMMENT
+NOTE: TapCart renders Shopify product pages in a custom native view, not a WebView. This means the Theme App Extension widget that works on the web product page may not automatically surface inside TapCart. Depending on the TapCart plan and architecture (resolved in Phase 0), this may require a separate TapCart native block or an embedded link to the web gallery view. This is flagged as a potential integration variable; Phase 0 will produce a concrete recommendation.
+#+END_COMMENT
+- In-app notifications for gallery activity confirmed (submission approved, comment received, upvote threshold)
+#+BEGIN_COMMENT
+NOTE: New Klaviyo event types from this phase validated through the push pipeline established in Phase 1. Same testing pattern as Phase 2.
+#+END_COMMENT
+
 ** Outcome
 
 A custom gallery system in production, replacing Elfsight and JotForm, surfacing community content on product pages, and integrated with your product catalog.
 
 ** Estimate
 
-$16,000 -- $24,000
+$18,000 -- $27,000
 
-The range reflects the product catalog integration complexity and the product page widget, which involves Shopify theme work and carries some variability depending on your current theme structure.
+The range reflects the product catalog integration complexity, the product page widget (Shopify theme work), and the TapCart integration for gallery (particularly the product page widget behaviour, which depends on the TapCart plan).
 
 * Phase 4 --- Online Event System
 
@@ -518,6 +590,20 @@ NOTE: The vod_url and vod_expiry stay in the DB permanently. The conditional res
 NOTE: When admin saves a VOD URL to an event record, your API fires a Klaviyo event: "Event VOD Available." Since you need to notify all registered attendees, your code runs: SELECT user_id FROM event_registrations WHERE event_id = ? and fires one Klaviyo event per customer. Klaviyo delivers per each customer's notification preferences.
 #+END_COMMENT
 
+*TapCart Integration*
+- Event registration and customer dashboard accessible inside TapCart via WebView
+#+BEGIN_COMMENT
+NOTE: Event browsing, registration (free and paid), and the customer event dashboard (Zoom link, VOD access) all surface inside TapCart via WebView using the authenticated session from Phase 1. Paid registration redirects to Shopify checkout, which TapCart already handles natively from Phase 1. The main validation work is confirming the checkout redirect and return flow work correctly when initiated from within the event WebView.
+#+END_COMMENT
+- VOD playback confirmed on mobile
+#+BEGIN_COMMENT
+NOTE: VOD links point to YouTube/Vimeo unlisted URLs. Confirming that these open correctly inside TapCart --- either in the WebView, in a native video player, or via the YouTube/Vimeo app, depending on TapCart's link handling behaviour. This is a UX validation step.
+#+END_COMMENT
+- Push notifications for event reminders and VOD availability confirmed in TapCart
+#+BEGIN_COMMENT
+NOTE: Klaviyo reminder flows and VOD-available notifications validated against the TapCart push pipeline. Same testing pattern as Phases 2 and 3.
+#+END_COMMENT
+
 ** Out of Scope for This Phase
 
 - Premium VOD packages and access tier gating (flagged in brief as future scope: agreed, best handled once the base system is running)
@@ -531,22 +617,26 @@ NOTE: Zoom has an API that could auto-create meetings when you create events. Th
 
 ** Estimate
 
-$11,000 -- $17,000
+$13,000 -- $20,000
+
+TapCart integration for this phase is primarily validation work reusing infrastructure from Phases 1--3.
 
 * Pricing Summary
 
-#+ATTR_LATEX: :environment longtable :align >{\bfseries}p{3.5cm}p{4.5cm}rr :booktabs t
-| Phase | Description                     | Low Estimate | High Estimate |
-|-------+---------------------------------+--------------+---------------|
-|     0 | Architecture & Discovery        | $4,000       | $6,000        |
-|     1 | Core Platform + Digital Library | $20,000      | $30,000       |
-|     2 | Comment System                  | $11,000      | $16,000       |
-|     3 | Gallery Submission System       | $16,000      | $24,000       |
-|     4 | Online Event System             | $11,000      | $17,000       |
-|-------+---------------------------------+--------------+---------------|
-|       | *Total*                         | *$62,000*    | *$93,000*     |
+#+ATTR_LATEX: :environment tabularx :width \linewidth :align >{\bfseries}p{3.5cm}Xrr :booktabs t
+| Phase | Description                                   | Low Estimate | High Estimate |
+|-------+-----------------------------------------------+--------------+---------------|
+|     0 | Architecture & Discovery                      | $5,000       | $7,000        |
+|     1 | Core Platform + Digital Library + TapCart App | $26,000      | $38,000       |
+|     2 | Comment System                                | $12,000      | $18,000       |
+|     3 | Gallery Submission System                     | $18,000      | $27,000       |
+|     4 | Online Event System                           | $13,000      | $20,000       |
+|-------+-----------------------------------------------+--------------+---------------|
+|       | *Total*                                       | *$74,000*    | *$110,000*    |
 
 All estimates are fixed-price per phase, scoped to the deliverables described above. Scope changes or additions during a phase are handled as separate line items with a written change request before work begins.
+
+These estimates do not include TapCart subscription costs, Apple Developer Program or Google Play developer account fees, or any third-party SaaS fees. Those are ongoing costs borne by the client.
 
 Phases are priced independently. You can choose to proceed with all four phases or stop after any phase. The platform foundation built in Phase 1 has value regardless of which subsequent modules are built.
 
@@ -571,9 +661,13 @@ NOTE: Intentionally the smallest payment. Most work is done and paid for by this
 
 * What I Would Need Before Phase 0
 
-- Confirmation of the four TapCart questions (or agreement to resolve them during Phase 0)
+- Confirmation that TapCart mobile app setup and delivery is in scope for this engagement
 #+BEGIN_COMMENT
-NOTE: Either the client has confirmed answers from TapCart already, or they explicitly agree that resolving these questions is in-scope for Phase 0. You cannot finalize the frontend architecture without this. It should be a concrete written commitment, not left as "we'll figure it out."
+NOTE: The client does not currently have TapCart. Before Phase 0 begins, there should be written agreement that TapCart account setup, app configuration, App Store submission, and per-phase feature integration are part of this engagement. The client will own the TapCart subscription and developer accounts; this engagement covers the setup and integration work.
+#+END_COMMENT
+- Agreement to resolve the TapCart integration questions during Phase 0
+#+BEGIN_COMMENT
+NOTE: The four TapCart open questions (New Customer Accounts auth compatibility, WebView session injection, push notification token exposure, and tier/cost) must be resolved in Phase 0 via direct engagement with TapCart support. This must be a concrete written commitment. The frontend architecture and Phase 1 TapCart foundation work cannot be finalized without these answers.
 #+END_COMMENT
 - Access to Klaviyo (API key and a sandbox account if available)
 #+BEGIN_COMMENT
@@ -584,8 +678,8 @@ NOTE: Klaviyo's Private API key is needed to call the Track API (emitting events
 
 * About Me (with regards to this type of work)
 
-I currently lead the design and delivery of production systems involving custom backend infrastructure, multi-system integrations, and complex application data 
-models. My background is more in systems architecture rather than agency-style web work, which is exactly why I am reading this brief as a platform design problem rather than a list of Shopify features.
+I currently lead design and delivery of production systems involving custom backend infrastructure, multi-system integrations, and complex application data 
+models. My background is more in systems architecture than front end web work, which is exactly why I am reading this brief as a platform design problem rather than a list of Shopify features.
 
 I am new to the Shopify ecosystem specifically, but the kind of system described in this brief - independent data layer, integration connectors, event pipelines, multi-surface delivery - is the type of work I do day to day.
 
@@ -600,13 +694,14 @@ I will be transparent about what I know and what I need to verify. The TapCart q
 - TapCart work is /architectural gating/ but actual TapCart implementation effort is embedded across phases depending on WebView vs native blocks
 
 ** Phase 0 — Architecture & Discovery
+Spec out the entire project, refine scope and timelines, address risks, verify vendor capabilities.
 - *4-6 weeks*
 
-** Phase 1 — Core Platform + Digital Library
-Primary drivers: auth + Shopify webhooks/fulfillment + historical order scan reliability + admin tools.
-- *12–16 weeks*
-  - Lower end if: New Customer Accounts integration is straightforward, order history scan is clean, admin panel is minimal.
-  - Upper end if: auth needs a workaround for TapCart, order history has edge cases, or you need deeper audit/support tooling.
+** Phase 1 — Core Platform + Digital Library + TapCart App Foundation
+Primary drivers: auth + Shopify webhooks/fulfillment + historical order scan reliability + admin tools + TapCart app setup, branding, and App Store/Play Store submission.
+- *12–17 weeks*
+  - Lower end if: New Customer Accounts integration is straightforward, order history scan is clean, TapCart plan is confirmed quickly, App Store review is fast.
+  - Upper end if: auth needs a workaround for TapCart, order history has edge cases, App Store review requires revisions, or TapCart plan or WebView SSO has integration surprises.
 
 ** Phase 2 — Comment System
 Primary drivers: threading + voting + moderation + Shopify blog embedding via theme app extension + notifications.
@@ -621,7 +716,7 @@ Primary drivers: paid registration via Shopify, capacity/race-condition handling
 - *6–8 weeks*
 
 ** Roll-up timelines
-- *Total: ~36–50 weeks* (≈ *9–12 months*)
+- *Total: ~38–53 weeks* (*9–13 months*)
 
 * Next Steps
 
